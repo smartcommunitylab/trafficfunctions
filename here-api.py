@@ -11,6 +11,8 @@ from pandas.io.json import json_normalize
 from botocore.client import Config
 from datetime import datetime
 
+from prometheus_client import Counter, REGISTRY, generate_latest
+
 #config
 S3_ENDPOINT=os.environ.get('S3_ENDPOINT')
 S3_ACCESS_KEY=os.environ.get('S3_ACCESS_KEY')
@@ -25,28 +27,25 @@ HERE_ENDPOINT="https://traffic.api.here.com/traffic/6.2/flow.json"
 BPOINTS_PARQUET='trentino-boundpoints.parquet'
 BBOX='45.667805,10.446625;46.547528,11.965485'
 
+def init_context(context):
+    global COUNTER_SEGMENTS
+    global COUNTER_TMC
+    global COUNTER_OUT
 
-class BytesIOWrapper(io.BufferedReader):
-    """Wrap a buffered bytes stream over TextIOBase string stream."""
+    context.logger.info('init')
+    COUNTER_SEGMENTS = Counter('segments', 'Number of SEGMENTS data frames read')
+    COUNTER_TMC = Counter('tmc', 'Number of TMC data frames read')
+    COUNTER_OUT = Counter('df', 'Number of TMC data frames filtered')
 
-    def __init__(self, text_io_buffer, encoding=None, errors=None, **kwargs):
-        super(BytesIOWrapper, self).__init__(text_io_buffer, **kwargs)
-        self.encoding = encoding or text_io_buffer.encoding or 'utf-8'
-        self.errors = errors or text_io_buffer.errors or 'strict'
 
-    def _encoding_call(self, method_name, *args, **kwargs):
-        raw_method = getattr(self.raw, method_name)
-        val = raw_method(*args, **kwargs)
-        return val.encode(self.encoding, errors=self.errors)
+def metrics(context, event):
+    context.logger.info('called metrics')
+    output = generate_latest().decode('UTF-8')
 
-    def read(self, size=-1):
-        return self._encoding_call('read', size)
-
-    def read1(self, size=-1):
-        return self._encoding_call('read1', size)
-
-    def peek(self, size=-1):
-        return self._encoding_call('peek', size)
+    return context.Response(body=output,
+        headers={},
+        content_type='text/plain',
+        status_code=200)       
 
 
 def read_json_from_url(url,params):
@@ -88,7 +87,24 @@ def grouped_weighted_average(self, values, weights, *groupby_args, **groupby_kwa
 #extend pd
 pd.DataFrame.grouped_weighted_average = grouped_weighted_average
 
+
 def handler(context, event):
+    try:
+        # check if metrics called
+        if event.trigger.kind == 'http' and event.method == 'GET' and event.path == '/metrics':
+            return metrics(context, event)
+        else:
+            return process(context, event)
+
+        
+    except Exception as e:
+        context.logger.error('Error: '+str(e))        
+        return context.Response(body='Error '+str(e),
+                        headers={},
+                        content_type='text/plain',
+                        status_code=500)   
+
+def process(context, event):   
     #init client
     s3 = boto3.client('s3',
                     endpoint_url=S3_ENDPOINT,
@@ -167,6 +183,7 @@ def handler(context, event):
 
         count = len(df)
         context.logger.info('read count: '+str(count))
+        COUNTER_SEGMENTS.inc(count)
 
         context.logger.info('process segments...')
 
@@ -188,6 +205,7 @@ def handler(context, event):
         resdf['timestamp'] = pd.to_datetime(resdf['timestamp'], format='%Y-%m-%dT%H:%M:%S.%f%z')
 
         context.logger.info('res count: '+str(len(resdf)))
+        COUNTER_TMC.inc(len(resdf))
 
         # write to io buffer
         context.logger.info('write parquet to buffer')
@@ -212,6 +230,7 @@ def handler(context, event):
         mergeddf = pd.merge(resdf, boundpoints, how='inner', left_on='tmc_id', right_on='LCD')
 
         context.logger.info('res count: '+str(len(mergeddf)))
+        COUNTER_OUT.inc(len(mergeddf))
 
         filename = filename + "-filtered"
         

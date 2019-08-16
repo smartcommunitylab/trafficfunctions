@@ -15,6 +15,9 @@ from botocore.client import Config
 from datetime import datetime
 from datetime import timedelta    
 
+from prometheus_client import multiprocess
+from prometheus_client import CollectorRegistry, Counter, REGISTRY, generate_latest,CONTENT_TYPE_LATEST
+
 #config
 S3_ENDPOINT=os.environ.get('S3_ENDPOINT')
 S3_ACCESS_KEY=os.environ.get('S3_ACCESS_KEY')
@@ -23,29 +26,31 @@ S3_BUCKET=os.environ.get('S3_BUCKET')
 INTERVAL=os.environ.get('INTERVAL')
 
 BBOX='45.667805,10.446625;46.547528,11.965485'
+# the following MUST be set via OS ENV for multiprocess
+# os.environ["prometheus_multiproc_dir"] = "/tmp"
 
 
-class BytesIOWrapper(io.BufferedReader):
-    """Wrap a buffered bytes stream over TextIOBase string stream."""
+def init_context(context):
+    global COUNTER_FRAMES
+    global COUNTER_DF
+    global COUNTER_OUT
+    context.logger.info('init')
+    COUNTER_FRAMES = Counter('frames', 'Number of file frames read')
+    COUNTER_DF = Counter('df', 'Number of data frames read')
+    COUNTER_OUT = Counter('out', 'Number of data frames outputted')
 
-    def __init__(self, text_io_buffer, encoding=None, errors=None, **kwargs):
-        super(BytesIOWrapper, self).__init__(text_io_buffer, **kwargs)
-        self.encoding = encoding or text_io_buffer.encoding or 'utf-8'
-        self.errors = errors or text_io_buffer.errors or 'strict'
 
-    def _encoding_call(self, method_name, *args, **kwargs):
-        raw_method = getattr(self.raw, method_name)
-        val = raw_method(*args, **kwargs)
-        return val.encode(self.encoding, errors=self.errors)
+def metrics(context, event):
+    context.logger.info('called metrics')
+    #use multiprocess metrics otherwise data collected from different processors is not included
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    output = generate_latest(registry).decode('UTF-8')
 
-    def read(self, size=-1):
-        return self._encoding_call('read', size)
-
-    def read1(self, size=-1):
-        return self._encoding_call('read1', size)
-
-    def peek(self, size=-1):
-        return self._encoding_call('peek', size)
+    return context.Response(body=output,
+        headers={},
+        content_type=CONTENT_TYPE_LATEST,
+        status_code=200)       
 
 
 def get_matching_s3_objects(s3,bucket, prefix="", suffix=""):
@@ -118,6 +123,22 @@ def parse_time(time_str):
 
 
 def handler(context, event):
+    try:
+        # check if metrics called
+        if event.trigger.kind == 'http' and event.method == 'GET' and event.path == '/metrics':
+            return metrics(context, event)
+        else:
+            return process(context, event)
+
+        
+    except Exception as e:
+        context.logger.error('Error: '+str(e))        
+        return context.Response(body='Error '+str(e),
+                        headers={},
+                        content_type='text/plain',
+                        status_code=500)   
+
+def process(context, event):            
     #params
     date = datetime.today().astimezone(pytz.UTC)
 
@@ -171,7 +192,7 @@ def handler(context, event):
 
 
     context.logger.info("interval "+INTERVAL+" for date "+str(date) + " as "+str(date_start)+" => "+str(date_end))      
-    context.logger.info("list frames for date "+str(date) + " from path "+path)      
+    context.logger.info("list frames for date "+str(date_start) + " from path "+path)      
     # fetch only data from selected bbox
     prefix = path+"traffic-bbox-"+bbox64+"-"
 
@@ -189,14 +210,20 @@ def handler(context, event):
                     kobj = s3.get_object(Bucket=S3_BUCKET, Key=key)
                     kdataio = io.BytesIO(kobj['Body'].read())
                     kdf = pd.read_parquet(kdataio, engine='pyarrow')
+                    #add confidence factor to old data if missing
+                    if 'confidence_factor' not in kdf:
+                        kdf['confidence_factor'] = 0.0
+
                     frames.append(kdf)
 
 
         context.logger.info('frames count: '+str(len(frames)))
-        
+        COUNTER_FRAMES.inc(len(frames))
+
         #concat
         df = pd.concat(frames)
         context.logger.info('res count: '+str(len(df)))
+        COUNTER_DF.inc(len(df))
 
         #parse data from timestamp
         df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%dT%H:%M:%S.%f%z')
@@ -207,7 +234,7 @@ def handler(context, event):
         grouped = df.groupby(['tmc_id'])
         bins = []
         for id, group in grouped:
-            rxf = group.groupby(pd.Grouper(key='timestamp',freq=INTERVAL))['tmc_id','speed','jam_factor','free_flow_speed'].mean().reset_index(level=['timestamp'])    
+            rxf = group.groupby(pd.Grouper(key='timestamp',freq=INTERVAL))['tmc_id','speed','jam_factor','free_flow_speed','confidence_factor'].mean().reset_index(level=['timestamp'])    
             bins.append(rxf)
 
         outdf = pd.concat(bins)
@@ -222,7 +249,7 @@ def handler(context, event):
         context.logger.info('out count: '+str(len(outdf)))
 
         # merge with data
-        df.drop(columns=['timestamp','speed','jam_factor','free_flow_speed'],inplace=True)
+        df.drop(columns=['timestamp','speed','jam_factor','free_flow_speed','confidence_factor'], inplace=True)
         # need to drop duplicates on df since it holds multiple measures
         df.drop_duplicates(keep='first', inplace=True)
 
@@ -230,7 +257,8 @@ def handler(context, event):
 
 
         context.logger.info('merged count: '+str(len(mergeddf)))
-        
+        COUNTER_OUT.inc(len(mergeddf))
+
         # write to io buffer
         context.logger.info('write parquet to buffer')
 
