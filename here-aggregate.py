@@ -16,7 +16,7 @@ from datetime import datetime
 from datetime import timedelta    
 
 from prometheus_client import multiprocess
-from prometheus_client import CollectorRegistry, Counter, REGISTRY, generate_latest,CONTENT_TYPE_LATEST
+from prometheus_client import CollectorRegistry, Counter, Summary, REGISTRY, generate_latest,CONTENT_TYPE_LATEST
 
 #config
 S3_ENDPOINT=os.environ.get('S3_ENDPOINT')
@@ -29,15 +29,14 @@ BBOX='45.667805,10.446625;46.547528,11.965485'
 # the following MUST be set via OS ENV for multiprocess
 # os.environ["prometheus_multiproc_dir"] = "/tmp"
 
+#prometheus metrics
+COUNTER_FRAMES = Counter('here_aggregate_frames', 'Number of file frames read')
+COUNTER_DF = Counter('here_aggregate_df', 'Number of data frames read')
+COUNTER_OUT = Counter('here_aggregate_out', 'Number of data frames outputted')
+REQUEST_TIME = Summary('here_aggregate_request_processing_seconds', 'Time spent processing request')
 
-def init_context(context):
-    global COUNTER_FRAMES
-    global COUNTER_DF
-    global COUNTER_OUT
-    context.logger.info('init')
-    COUNTER_FRAMES = Counter('frames', 'Number of file frames read')
-    COUNTER_DF = Counter('df', 'Number of data frames read')
-    COUNTER_OUT = Counter('out', 'Number of data frames outputted')
+# def init_context(context):
+#     context.logger.info('init')
 
 
 def metrics(context, event):
@@ -125,8 +124,14 @@ def parse_time(time_str):
 def handler(context, event):
     try:
         # check if metrics called
-        if event.trigger.kind == 'http' and event.method == 'GET' and event.path == '/metrics':
-            return metrics(context, event)
+        if event.trigger.kind == 'http' and event.method == 'GET':
+            if event.path == '/metrics':
+                return metrics(context, event)
+            else:
+                return context.Response(body='Error not supported',
+                        headers={},
+                        content_type='text/plain',
+                        status_code=405)  
         else:
             return process(context, event)
 
@@ -138,6 +143,7 @@ def handler(context, event):
                         content_type='text/plain',
                         status_code=500)   
 
+@REQUEST_TIME.time()
 def process(context, event):            
     #params
     date = datetime.today().astimezone(pytz.UTC)

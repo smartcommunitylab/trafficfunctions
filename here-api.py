@@ -11,7 +11,8 @@ from pandas.io.json import json_normalize
 from botocore.client import Config
 from datetime import datetime
 
-from prometheus_client import Counter, REGISTRY, generate_latest
+from prometheus_client import multiprocess
+from prometheus_client import CollectorRegistry, Counter, Summary, REGISTRY, generate_latest,CONTENT_TYPE_LATEST
 
 #config
 S3_ENDPOINT=os.environ.get('S3_ENDPOINT')
@@ -27,24 +28,26 @@ HERE_ENDPOINT="https://traffic.api.here.com/traffic/6.2/flow.json"
 BPOINTS_PARQUET='trentino-boundpoints.parquet'
 BBOX='45.667805,10.446625;46.547528,11.965485'
 
-def init_context(context):
-    global COUNTER_SEGMENTS
-    global COUNTER_TMC
-    global COUNTER_OUT
+#prometheus metrics
+COUNTER_SEGMENTS = Counter('here_api_segments', 'Number of SEGMENTS data frames read')
+COUNTER_TMC = Counter('here_api_tmc', 'Number of TMC data frames read')
+COUNTER_OUT = Counter('here_api_df', 'Number of TMC data frames filtered')
+REQUEST_TIME = Summary('here_api_request_processing_seconds', 'Time spent processing request')
 
-    context.logger.info('init')
-    COUNTER_SEGMENTS = Counter('segments', 'Number of SEGMENTS data frames read')
-    COUNTER_TMC = Counter('tmc', 'Number of TMC data frames read')
-    COUNTER_OUT = Counter('df', 'Number of TMC data frames filtered')
+# def init_context(context):
+#     context.logger.info('init')
 
 
 def metrics(context, event):
     context.logger.info('called metrics')
-    output = generate_latest().decode('UTF-8')
+    #use multiprocess metrics otherwise data collected from different processors is not included
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    output = generate_latest(registry).decode('UTF-8')
 
     return context.Response(body=output,
         headers={},
-        content_type='text/plain',
+        content_type=CONTENT_TYPE_LATEST,
         status_code=200)       
 
 
@@ -91,8 +94,14 @@ pd.DataFrame.grouped_weighted_average = grouped_weighted_average
 def handler(context, event):
     try:
         # check if metrics called
-        if event.trigger.kind == 'http' and event.method == 'GET' and event.path == '/metrics':
-            return metrics(context, event)
+        if event.trigger.kind == 'http' and event.method == 'GET':
+            if event.path == '/metrics':
+                return metrics(context, event)
+            else:
+                return context.Response(body='Error not supported',
+                        headers={},
+                        content_type='text/plain',
+                        status_code=405)  
         else:
             return process(context, event)
 
@@ -104,6 +113,7 @@ def handler(context, event):
                         content_type='text/plain',
                         status_code=500)   
 
+@REQUEST_TIME.time()
 def process(context, event):   
     #init client
     s3 = boto3.client('s3',
