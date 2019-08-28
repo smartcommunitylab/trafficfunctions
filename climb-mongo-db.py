@@ -7,6 +7,7 @@ import base64
 import time  
 import pymongo
 import sqlalchemy
+import pytz
 
 
 from datetime import datetime
@@ -39,8 +40,7 @@ def _connect_mongo(host, port, username, password, db, authdb):
         mongo_uri = 'mongodb://%s:%s@%s:%s/%s?authSource=%s' % (username, password, host, port, db, authdb)
         conn = MongoClient(mongo_uri)
     else:
-        conn = MongoClient(host, port)
-
+        conn = MongoClient(host, int(port))
 
     return conn[db]
 
@@ -99,14 +99,11 @@ def handler(context, event):
         date_start = date.replace(minute=00,second=00, microsecond=00) - timedelta(hours=1)
         date_end = date_start + timedelta(seconds=86399)
 
-        filename='climb-{}-'+ date_start.strftime('%Y-%m-%dT%H:%M:%S')+"_"+date_end.strftime('%Y-%m-%dT%H:%M:%S')
-        path = date_start.strftime('%Y%m')+"/"
-
         #init client
         engine = sqlalchemy.create_engine('postgresql://'+DB_USERNAME+':'+DB_PASSWORD+'@'+DB_HOST+':'+DB_PORT+'/'+DB_NAME)
 
         # init client
-        db = _connect_mongo(host=MONGODB_HOST, port=MONGODB_PORT, username=MONGODB_USERNAME, password=MONGODB_PASS, db=MONGODB_DB, authdb=MONGODB_AUTHD)
+        db = _connect_mongo(host=MONGODB_HOST, port=MONGODB_PORT, username=MONGODB_USERNAME, password=MONGODB_PASS, db=MONGODB_DB, authdb=MONGODB_AUTHDB)
 
         # read shared data
         context.logger.info('read shared data...')
@@ -125,19 +122,19 @@ def handler(context, event):
 
         query_events_101 = {'timestamp': {'$gte': date_start, '$lte': date_end},'eventType': {'$eq': 101}}
         df_events_101 = read_events(db, query_events_101)
-        df_events_101.set_index('passengerId', inplace=True)
+        df_events_101.set_index(['passengerId','routeId'], inplace=True)
 
         query_events_102 = {'timestamp': {'$gte': date_start, '$lte': date_end},'eventType': {'$eq': 102}}
         df_events_102 = read_events(db, query_events_102)
-        df_events_102.set_index('passengerId', inplace=True)
+        df_events_102.set_index(['passengerId','routeId'], inplace=True)
 
         query_events_103 = {'timestamp': {'$gte': date_start, '$lte': date_end},'eventType': {'$eq': 103}}
         df_events_103 = read_events(db, query_events_103)
-        df_events_103.set_index('passengerId', inplace=True)
+        df_events_103.set_index(['passengerId','routeId'], inplace=True)
 
         query_events_104 = {'timestamp': {'$gte': date_start, '$lte': date_end},'eventType': {'$eq': 104}}
         df_events_104 = read_events(db, query_events_104)
-        df_events_104.set_index('passengerId', inplace=True)
+        df_events_104.set_index(['passengerId','routeId'], inplace=True)
 
         query_events_501 = {'timestamp': {'$gte': date_start, '$lte': date_end},'eventType': {'$eq': 501}}
         df_events_501 = read_events(db, query_events_501)
@@ -147,13 +144,14 @@ def handler(context, event):
         context.logger.info('compose events...')
         events = []
         for idx, row in df_events_102.iterrows():
-            passengerId = idx
+            passengerId = idx[0]
+            routeId = idx[1]
 
             #check if arrived == has event 104
-            toDestination = passengerId in df_events_104.index
+            toDestination = idx in df_events_104.index
 
             #autoCheckin guess == has event 101
-            autoCheckin = passengerId in df_events_101.index
+            autoCheckin = idx in df_events_101.index
 
             #fetch battery data = has event 501 with battery status
             batteryLevel = -1
@@ -166,7 +164,8 @@ def handler(context, event):
 
             #merge
             e = row
-            e['passengerId'] = idx
+            e['passengerId'] = passengerId
+            e['routeId'] = routeId
             e['toDestination'] = toDestination
             e['autoCheckin'] = autoCheckin
             e['batteryLevel'] = batteryLevel
@@ -176,7 +175,8 @@ def handler(context, event):
             events.append(e)
 
         #parse as dataFrame        
-        df_events_passengers = pd.DataFrame(events)    
+        df_events_passengers = pd.DataFrame(events)   
+        df_events_passengers.reset_index(inplace=True)
         df_events_passengers.drop(axis=1, columns=['creationDate','lastUpdate','wsnNodeId','eventType'], inplace=True)
 
         #merge with related info
@@ -190,7 +190,7 @@ def handler(context, event):
         context.logger.info('passenger events count: '+str(len(df_events_passengers)))
 
         #write to db with append
-        df.to_sql(DB_TABLE_PREFIX+"passenger", engine, schema=DB_SCHEMA, index=False, if_exists='append', method='multi', chunksize=DB_CHUNKSIZE)
+        df_events_passengers.to_sql(DB_TABLE_PREFIX+"passenger", engine, schema=DB_SCHEMA, index=False, if_exists='append', method='multi', chunksize=DB_CHUNKSIZE)
 
         # process volunteers
         context.logger.info('process volunteers...')
@@ -207,8 +207,8 @@ def handler(context, event):
         df_events_301.drop(axis=1, columns=['creationDate','lastUpdate','wsnNodeId','eventType'], inplace=True, errors='ignore')
         df_events_301.set_index('volunteerId', inplace=True)        
 
-        query_events_301 = {'timestamp': {'$gte': date_start, '$lte': date_end},'eventType': {'$eq': 301}}
-        df_events_301 = read_events(db, query_events_301)
+        query_events_302 = {'timestamp': {'$gte': date_start, '$lte': date_end},'eventType': {'$eq': 302}}
+        df_events_302 = read_events(db, query_events_302)
         df_events_302['isDriver'] = False
         df_events_302.drop(axis=1, columns=['creationDate','lastUpdate','wsnNodeId','eventType'], inplace=True, errors='ignore')
         df_events_302.set_index('volunteerId', inplace=True)
@@ -229,7 +229,7 @@ def handler(context, event):
         context.logger.info('volunteer events count: '+str(len(df_events_volunteer)))
 
         #write to db with append
-        df.to_sql(DB_TABLE_PREFIX+"volunteer", engine, schema=DB_SCHEMA, index=False, if_exists='append', method='multi', chunksize=DB_CHUNKSIZE)
+        df_events_volunteer.to_sql(DB_TABLE_PREFIX+"volunteer", engine, schema=DB_SCHEMA, index=False, if_exists='append', method='multi', chunksize=DB_CHUNKSIZE)
 
 
     except Exception as e:
