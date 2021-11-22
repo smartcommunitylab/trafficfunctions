@@ -28,6 +28,7 @@ S3_BUCKET = os.environ.get('S3_BUCKET')
 #static setup 
 ENDPOINT_BIKE="https://os.smartcommunitylab.it/core.mobility/bikesharing/{0}"
 CITIES=['trento', 'rovereto', 'pergine_valsugana', 'lavis', 'mezzocorona', 'mezzolombardo', 'sanmichelealladige']
+PARTITIONED=True
 
 #prometheus metrics
 REQUEST_TIME = Summary('bike_api_request_processing_seconds', 'Time spent processing request')
@@ -113,8 +114,11 @@ def process(context, event):
 
     for city in cities:
         context.logger.info('fetch data for city '+city)
-        filename='{}/{}/{}/bike-{}-{}'.format(city,day,hour,city,now.strftime('%Y%m%dT%H%M%S'))
-
+        if(PARTITIONED):
+            daypath = 'year='+now.strftime('%Y')+'/month='+now.strftime('%m')+'/day='+now.strftime('%d')+'/hour='+now.strftime('%H')+'/'
+            filename='city={}/{}/bike-{}-{}'.format(city,daypath,city,now.strftime('%Y%m%dT%H%M%S'))
+        else:
+            filename='{}/{}/{}/bike-{}-{}'.format(city,day,hour,city,now.strftime('%Y%m%dT%H%M%S'))
 
         #load traffic
         context.logger.info('read bikes for '+city)
@@ -134,6 +138,10 @@ def process(context, event):
 
             #rename and drop columns
             df = df[['timestamp','id','name','address','bikes','slots','totalSlots','latitude','longitude']]
+
+            if( not PARTITIONED):
+                # add city column
+                df['city'] = city
 
             # write to io buffer
             context.logger.info('write parquet to buffer')
