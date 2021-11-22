@@ -28,6 +28,7 @@ S3_BUCKET = os.environ.get('S3_BUCKET')
 #static setup 
 ENDPOINT_PARKINGS="https://os.smartcommunitylab.it/core.mobility/getparkingsbyagency/{0}"
 CITIES=['COMUNE_DI_TRENTO', 'COMUNE_DI_ROVERETO']
+PARTITIONED=True
 
 #prometheus metrics
 REQUEST_TIME = Summary('parkings_api_request_processing_seconds', 'Time spent processing request')
@@ -113,8 +114,11 @@ def process(context, event):
 
     for city in cities:
         context.logger.info('fetch data for city '+city)
-        filename='{}/{}/{}/parkings-{}-{}'.format(city,day,hour,city,now.strftime('%Y%m%dT%H%M%S'))
-
+        if(PARTITIONED):
+            daypath = 'year='+now.strftime('%Y')+'/month='+now.strftime('%m')+'/day='+now.strftime('%d')+'/hour='+now.strftime('%H')+'/'
+            filename='city={}/{}/parkings-{}-{}'.format(city,daypath,city,now.strftime('%Y%m%dT%H%M%S'))
+        else:
+            filename='{}/{}/{}/parkings-{}-{}'.format(city,day,hour,city,now.strftime('%Y%m%dT%H%M%S'))
 
         #load traffic
         context.logger.info('read parkings for '+city)
@@ -134,6 +138,10 @@ def process(context, event):
 
             #rename and drop columns
             df = df[['timestamp','name','description','slotsAvailable','slotsTotal','monitored','latitude','longitude']]
+
+            if( not PARTITIONED):
+                # add city column
+                df['city'] = city
 
             # write to io buffer
             context.logger.info('write parquet to buffer')
